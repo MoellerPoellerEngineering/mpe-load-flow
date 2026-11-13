@@ -1,0 +1,1085 @@
+"""Streamlit interface for PowerFactory load-flow CSV sweeps."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
+import re
+from typing import Callable, Sequence
+
+import pandas as pd
+import streamlit as st
+
+from case_filters import case_labels, filter_cases, token_values, varying_token_positions
+from equipment_pills import equipment_pills
+from channel_catalogue import (
+    discover_loading_objects,
+    discover_poc_objects,
+    discover_power_factor_objects,
+    discover_wtg_objects,
+    resolve_channel,
+)
+from data_loader import (
+    CaseData,
+    InputFile,
+    ParseResult,
+    discover_local_inputs,
+    expand_inputs,
+    is_mapping_filename,
+    parse_cases,
+)
+from limit_analysis import (
+    equipment_loading_limit_violations,
+    wtg_pq_limit_violations,
+    wtg_voltage_limit_violations,
+)
+from mapping import MappingResult, load_mapping, token_heading
+from plotting import (
+    PlotOptions,
+    PlotSet,
+    build_equipment_loading_figures,
+    build_poc_pq_figures,
+    build_power_factor_figures,
+    build_wtg_pq_figures,
+    build_wtg_voltage_figures,
+    plotted_data_csv,
+)
+from validation import ValidationIssue
+
+
+APP_DIR = Path(__file__).resolve().parent
+INPUT_DIR = APP_DIR / "Input_files"
+APP_ICON_PATH = APP_DIR / "assets" / "mpe_app_icon.png"
+APP_LOGO_PATH = APP_DIR / "assets" / "mpe_logo.png"
+TAB_NAMES = ("WTG P–Q", "WTG Terminal Voltage", "Equipment Loading", "POC P–Q", "Power Factor")
+LAYOUTS = ("1 plot", "1×2", "2×2")
+CASE_FILTER_DEFAULTS_VERSION = 2
+PLOT_CACHE_VERSION = 24
+VIOLATION_CACHE_VERSION = 1
+_PLOT_WIDTH_SENSOR = st.components.v2.component(
+    "mpe_plot_width_sensor",
+    html='<div id="plot-width-sensor" aria-hidden="true"></div>',
+    css="#plot-width-sensor { width: 100%; height: 0; overflow: hidden; }",
+    js="""
+const sensors = new WeakMap()
+
+export default function (component) {
+  const { data, parentElement, setStateValue } = component
+  const host = parentElement.host
+  const previous = sensors.get(parentElement)
+  if (previous) {
+    clearTimeout(previous.timer)
+    previous.observer.disconnect()
+  }
+
+  const sensor = { observer: null, timer: null }
+  let lastWidth = Number(data?.width ?? 0)
+  const reportWidth = () => {
+    const width = Math.round(host.getBoundingClientRect().width / 24) * 24
+    if (width > 0 && width !== lastWidth) {
+      lastWidth = width
+      setStateValue("width", width)
+    }
+  }
+  const observer = new ResizeObserver(() => {
+    clearTimeout(sensor.timer)
+    sensor.timer = setTimeout(reportWidth, 120)
+  })
+  sensor.observer = observer
+  sensors.set(parentElement, sensor)
+  observer.observe(host)
+  reportWidth()
+
+  return () => {
+    clearTimeout(sensor.timer)
+    observer.disconnect()
+    if (sensors.get(parentElement) === sensor) sensors.delete(parentElement)
+  }
+}
+""",
+)
+
+
+@dataclass(frozen=True)
+class ObjectCatalogue:
+    wtg_pq: tuple[str, ...]
+    wtg_voltage: tuple[str, ...]
+    loading: tuple[str, ...]
+    poc: tuple[str, ...]
+    power_factor: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ParsedSources:
+    parsed: ParseResult
+    mapping_files: tuple[InputFile, ...]
+    issues: tuple[ValidationIssue, ...]
+    header_issues: tuple[ValidationIssue, ...]
+    csv_count: int
+
+
+@st.cache_resource(show_spinner=False, max_entries=1, scope="session")
+def _cached_local_inputs(input_dir: Path, signature: tuple[tuple[str, int, int], ...]) -> tuple[InputFile, ...]:
+    del signature
+    return discover_local_inputs(input_dir)
+
+
+@st.cache_resource(show_spinner=False, max_entries=1, scope="session")
+def _cached_upload_inputs(
+    signature: tuple[tuple[str, str, int], ...], _uploads: tuple
+) -> tuple[InputFile, ...]:
+    del signature
+    return tuple(
+        InputFile(
+            name=uploaded.name,
+            source_path=f"upload:/{uploaded.name}",
+            content=uploaded.getvalue(),
+            origin="upload",
+        )
+        for uploaded in _uploads
+    )
+
+
+@st.cache_resource(show_spinner="Reading CSV results…", max_entries=1, scope="session")
+def _cached_parse(signature: tuple[tuple[str, str, str], ...], _files: tuple[InputFile, ...]) -> ParsedSources:
+    del signature
+    expanded = expand_inputs(_files)
+    parsed = parse_cases(expanded.csv_files)
+    return ParsedSources(
+        parsed=parsed,
+        mapping_files=expanded.mapping_files,
+        issues=expanded.issues,
+        header_issues=_header_variation_issues(parsed.cases),
+        csv_count=len(expanded.csv_files),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=2, scope="session")
+def _cached_object_catalogue(signature: tuple[tuple[str, str, str], ...], _cases: tuple[CaseData, ...]) -> ObjectCatalogue:
+    del signature
+    wtg = discover_wtg_objects(_cases)
+
+    def eligible_wtg(first_role: str, second_role: str) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in wtg
+            if any(
+                resolve_channel(case, name, first_role).status == "found"
+                and resolve_channel(case, name, second_role).status == "found"
+                for case in _cases
+            )
+        )
+
+    return ObjectCatalogue(
+        wtg_pq=eligible_wtg("active_power", "reactive_power"),
+        wtg_voltage=eligible_wtg("active_power", "voltage"),
+        loading=tuple(discover_loading_objects(_cases)),
+        poc=tuple(discover_poc_objects(_cases)),
+        power_factor=tuple(discover_power_factor_objects(_cases)),
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=5, scope="session")
+def _cached_plot_set(
+    signature: tuple[object, ...],
+    _builder: Callable[..., PlotSet],
+    _args: tuple,
+    _kwargs: dict,
+) -> PlotSet:
+    return _builder(*_args, **_kwargs)
+
+
+@st.cache_data(show_spinner=False, max_entries=16, scope="session")
+def _cached_mapping(signature: tuple[str, str, str], _source: InputFile) -> MappingResult:
+    del signature
+    return load_mapping(_source)
+
+
+@st.cache_data(show_spinner=False, max_entries=32, scope="session")
+def _cached_violation_rows(
+    signature: tuple[object, ...],
+    _builder: Callable[..., Sequence[dict[str, str | int | float]]],
+    _cases: tuple[CaseData, ...],
+    _selected_objects: tuple[str, ...],
+    _labels: dict[str, str],
+    _parameters: tuple[object, ...],
+) -> tuple[dict[str, str | int | float], ...]:
+    return tuple(_builder(_cases, _selected_objects, _labels, *_parameters))
+
+
+def _local_stat_signature(input_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    if not input_dir.is_dir():
+        return ()
+    result = []
+    for path in sorted(input_dir.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        if not path.is_file() or "__macosx" in {part.casefold() for part in path.parts}:
+            continue
+        if path.suffix.casefold() not in {".csv", ".zip", ".xlsx"}:
+            continue
+        stat = path.stat()
+        result.append((path.relative_to(input_dir).as_posix(), stat.st_size, stat.st_mtime_ns))
+    return tuple(result)
+
+
+def _source_signature(files: Sequence[InputFile]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted((source.origin, source.source_path, source.digest) for source in files))
+
+
+def _violation_cache_signature(
+    tab_id: str,
+    cases: Sequence[CaseData],
+    selected_objects: Sequence[str],
+    labels: dict[str, str],
+    parameters: tuple[object, ...] = (),
+) -> tuple[object, ...]:
+    return (
+        VIOLATION_CACHE_VERSION,
+        tab_id,
+        tuple((case.case_id, case.source_path, case.sha256) for case in cases),
+        tuple(selected_objects),
+        tuple(sorted(labels.items())),
+        parameters,
+    )
+
+
+def _mapping_signature(source: InputFile) -> tuple[str, str, str]:
+    return source.origin, source.source_path, source.digest
+
+
+def _issue_for_mapping(source: InputFile, message: str, code: str) -> ValidationIssue:
+    return ValidationIssue("error", code, message, source.source_path)
+
+
+def _select_mapping(
+    candidates: Sequence[InputFile],
+) -> tuple[InputFile | None, MappingResult, tuple[ValidationIssue, ...]]:
+    if not candidates:
+        st.session_state.pop("mapping_choice", None)
+        return None, MappingResult({}, ()), ()
+
+    if len(candidates) == 1:
+        st.session_state.pop("mapping_choice", None)
+        source = candidates[0]
+        return source, _cached_mapping(_mapping_signature(source), source), ()
+
+    keys = {
+        f"{source.origin}|{source.source_path}|{source.digest}": source
+        for source in sorted(candidates, key=lambda item: (item.source_path.casefold(), item.origin))
+    }
+    labels = {
+        key: f"{source.source_path} · {source.origin}"
+        for key, source in keys.items()
+    }
+    options: list[str | None] = [None, *keys]
+    choice_key = "mapping_choice"
+    if choice_key not in st.session_state:
+        st.session_state[choice_key] = None
+    elif st.session_state[choice_key] not in options:
+        st.session_state[choice_key] = None
+
+    selected_key = st.selectbox(
+        "Mapping workbook",
+        options,
+        key=choice_key,
+        format_func=lambda key: "Use fallback headings" if key is None else labels[key],
+        help="The workbook names the case filters; available values come from filenames.",
+    )
+    if selected_key is None:
+        return None, MappingResult({}, ()), (
+            _issue_for_mapping(
+                candidates[0],
+                "Several mapping workbooks are available. Choose one explicitly or select fallback headings.",
+                "mapping_choice_required",
+            ),
+        )
+    source = keys[selected_key]
+    result = _cached_mapping(_mapping_signature(source), source)
+    return source, result, ()
+
+
+def _initial_selection(key: str, label: str, options: Sequence[str], defaults: Sequence[str]) -> list[str]:
+    available = list(options)
+    if not available:
+        st.caption(f"No {label.casefold()} available.")
+        return []
+    return equipment_pills(label, available, defaults, key=key)
+
+
+def _grouped_source_options(
+    options: Sequence[str], grouping: dict[str, str]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    grouped: dict[str, list[str]] = {group: [] for group in dict.fromkeys(grouping.values())}
+    for option in options:
+        group = grouping.get(option)
+        if group in grouped:
+            grouped[group].append(option)
+    groups = tuple((group, tuple(members)) for group, members in grouped.items() if members)
+    return (*groups, ("All cases", tuple(options))) if groups else ()
+
+
+def _set_case_filter_values(key: str, values: tuple[str, ...], selected: bool) -> None:
+    st.session_state["case_filters_all"] = False
+    for value in values:
+        st.session_state[_case_checkbox_key(key, value)] = selected
+
+
+def _select_all_cases() -> None:
+    st.session_state["case_filters_all"] = True
+
+
+def _case_filter_changed() -> None:
+    st.session_state["case_filters_all"] = False
+
+
+def _case_checkbox_key(key: str, value: str) -> str:
+    return f"{key}::v{CASE_FILTER_DEFAULTS_VERSION}::{value}"
+
+
+def _reset_case_filters() -> None:
+    for key in tuple(st.session_state):
+        if key.startswith("case_filter_"):
+            del st.session_state[key]
+    st.session_state["case_filters_all"] = False
+
+
+def _case_filter_controls(cases: Sequence[CaseData], headings: dict[int, str]) -> list[CaseData]:
+    dataset_signature = tuple((case.case_id, case.source_path, case.sha256) for case in cases)
+    if (
+        st.session_state.get("cases_dataset_signature") != dataset_signature
+        or st.session_state.get("case_filter_defaults_version") != CASE_FILTER_DEFAULTS_VERSION
+    ):
+        _reset_case_filters()
+        st.session_state["cases_dataset_signature"] = dataset_signature
+        st.session_state["case_filter_defaults_version"] = CASE_FILTER_DEFAULTS_VERSION
+
+    token_count = max((len(case.tokens) for case in cases), default=0)
+    if not token_count:
+        st.info("No valid CSV cases are available for filtering.")
+        return []
+
+    selected_sets: list[set[str]] = []
+    for position in range(token_count):
+        options = token_values(cases, position, selected_sets)
+        key = f"case_filter_{position}"
+        label = token_heading(position + 1, headings)
+        all_selected = st.session_state.get("case_filters_all", False)
+        previous = st.session_state.get(key)
+        selection = (
+            list(options)
+            if all_selected
+            else list(options[:1])
+            if previous is None
+            else [value for value in previous if value in options]
+        )
+        removed = [] if all_selected or previous is None else [value for value in previous if value not in options]
+        if removed:
+            st.session_state[key] = selection
+            for value in removed:
+                checkbox_key = _case_checkbox_key(key, value)
+                if checkbox_key in st.session_state:
+                    st.session_state[checkbox_key] = False
+
+        for value in options:
+            checkbox_key = _case_checkbox_key(key, value)
+            if all_selected:
+                st.session_state[checkbox_key] = True
+            elif checkbox_key not in st.session_state:
+                st.session_state[checkbox_key] = value in selection
+
+        selected_count = sum(st.session_state[_case_checkbox_key(key, value)] for value in options)
+        with st.container(border=True, gap="small"):
+            st.markdown(f"**{position + 1}. {label}** · {selected_count}/{len(options)} selected")
+            option_columns = st.columns(2)
+            for option_index, value in enumerate(options):
+                checkbox_key = _case_checkbox_key(key, value)
+                option_columns[option_index % 2].checkbox(
+                    value, key=checkbox_key, on_change=_case_filter_changed
+                )
+            action_columns = st.columns(2)
+            action_columns[0].button(
+                "Select all",
+                key=f"{key}_select_all",
+                on_click=_set_case_filter_values,
+                args=(key, tuple(options), True),
+                disabled=not options,
+                width="stretch",
+            )
+            action_columns[1].button(
+                "Clear all",
+                key=f"{key}_clear_all",
+                on_click=_set_case_filter_values,
+                args=(key, tuple(options), False),
+                disabled=not options,
+                width="stretch",
+            )
+
+        selected = [
+            value for value in options if st.session_state.get(_case_checkbox_key(key, value), False)
+        ]
+        st.session_state[key] = selected
+        selected_sets.append(set(selected))
+        if removed:
+            st.caption(f"Removed after earlier filter change: {', '.join(removed)}")
+
+    selected = filter_cases(cases, selected_sets)
+    st.caption(f"{len(selected):,} of {len(cases):,} cases selected")
+    return selected
+
+
+def _case_label_map(cases: Sequence[CaseData]) -> dict[str, str]:
+    return case_labels(cases, varying_token_positions(cases))
+
+
+def _plot_layout_control(tab_id: str) -> str:
+    layout_key = f"{tab_id}_layout"
+    if st.session_state.get(layout_key) is None:
+        st.session_state[layout_key] = LAYOUTS[0]
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", width="content"):
+        st.caption("Plot layout:", width="content")
+        return st.segmented_control(
+            "Plot layout",
+            LAYOUTS,
+            key=layout_key,
+            width="content",
+            label_visibility="collapsed",
+        )
+
+
+def _inline_control_label(label: str) -> None:
+    st.caption(f"{label}:", width="content")
+
+
+def _plot_cache_signature(
+    tab_id: str,
+    cases: Sequence[CaseData],
+    selected_objects: Sequence[str],
+    labels: dict[str, str],
+    options: PlotOptions,
+    settings: dict[str, object],
+) -> tuple[object, ...]:
+    return (
+        PLOT_CACHE_VERSION,
+        tab_id,
+        tuple((case.case_id, case.source_path, case.sha256) for case in cases),
+        tuple(selected_objects),
+        tuple(sorted(labels.items())),
+        options,
+        tuple(sorted(settings.items())),
+    )
+
+
+def _plot_width_key(layout: str) -> str:
+    columns_per_row = 2 if layout == "2×2" else 1
+    return f"plot_panel_width_{columns_per_row}_column"
+
+
+def _plot_panel_width(layout: str) -> int | None:
+    width = st.session_state.get(_plot_width_key(layout), {}).get("width")
+    return int(width) if width else None
+
+
+def _measure_plot_panel(layout: str) -> None:
+    key = _plot_width_key(layout)
+    width = st.session_state.get(key, {}).get("width", 0)
+    _PLOT_WIDTH_SENSOR(
+        key=key,
+        data={"width": width},
+        default={"width": 0},
+        on_width_change=lambda: None,
+        width="stretch",
+        height="content",
+    )
+
+
+def _selected_violation_bundle_ids(
+    selection_key: str | None,
+    rows: Sequence[dict[str, str | int | float]],
+) -> frozenset[tuple[str, str]] | None:
+    if selection_key is None:
+        return None
+    state = st.session_state.get(selection_key, {})
+    selection = state.get("selection", {}) if isinstance(state, dict) else {}
+    selected_rows = selection.get("rows", ()) if isinstance(selection, dict) else ()
+    bundle_ids = frozenset(
+        (rows[index]["_case_id"], rows[index]["_object_name"])
+        for index in selected_rows
+        if isinstance(index, int) and 0 <= index < len(rows)
+    )
+    return bundle_ids or None
+
+
+def _violation_table_key(
+    tab_id: str,
+    rows: Sequence[dict[str, str | int | float]],
+    cases: Sequence[CaseData],
+    selected_objects: Sequence[str],
+) -> str:
+    signature = (
+        tuple((case.case_id, case.source_path, case.sha256) for case in cases),
+        tuple(selected_objects),
+        tuple(tuple((column, row[column]) for column in sorted(row)) for row in rows),
+    )
+    digest = sha256(repr(signature).encode("utf-8")).hexdigest()[:12]
+    return f"{tab_id}_limit_violations_{digest}"
+
+
+def _render_violation_table(
+    selection_key: str,
+    title: str,
+    rows: Sequence[dict[str, str | int | float]],
+    empty_message: str,
+) -> None:
+    st.subheader(title)
+    if not rows:
+        st.info(empty_message)
+        return
+
+    number_formats = {
+        "P at worst point (MW)": "%.3f",
+        "X at worst point (MW)": "%.3f",
+        "Q (Mvar)": "%.3f",
+        "Limit (Mvar)": "%.3f",
+        "Excess (Mvar)": "%.3f",
+        "Voltage (p.u.)": "%.4f",
+        "Limit (p.u.)": "%.4f",
+        "Excess (p.u.)": "%.4f",
+        "Loading (%)": "%.3f",
+        "Limit (%)": "%.3f",
+        "Excess (%)": "%.3f",
+    }
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        height=min(42 + 36 * min(len(rows), 8), 330),
+        key=selection_key,
+        on_select="rerun",
+        selection_mode="multi-row",
+        column_order=tuple(column for column in rows[0] if not column.startswith("_")),
+        column_config={
+            column: st.column_config.NumberColumn(format=format_string)
+            for column, format_string in number_formats.items()
+            if column in rows[0]
+        },
+    )
+
+
+def _render_plotset(
+    tab_id: str,
+    plot_set: PlotSet,
+    cases: Sequence[CaseData],
+    layout: str,
+    *,
+    violation_heading: str | None = None,
+    violation_rows: Sequence[dict[str, str | int | float]] | None = None,
+    violation_empty_message: str = "",
+    violation_table_key: str | None = None,
+    case_option_rows: Sequence[dict[str, str]] = (),
+) -> None:
+    if not cases:
+        st.info("No cases match the current filters. Select more values or click All cases in the sidebar.")
+        return
+    if not plot_set.bundles or not plot_set.figures:
+        st.info("No curves are available for the current case and source selections. Check the validation details and axis source.")
+        return
+
+    case_count = len({bundle.case.case_id for bundle in plot_set.bundles})
+    object_count = len({bundle.element_name for bundle in plot_set.bundles})
+    trace_count = sum(len(bundle.curves) for bundle in plot_set.bundles)
+    st.caption(f"{case_count:,} cases · {object_count:,} elements · {trace_count:,} curves · {len(plot_set.figures)} panels")
+
+    figures = plot_set.figures
+    columns_per_row = 2 if layout == "2×2" else 1
+    with st.container(gap="xxsmall" if layout == "2×2" else "small"):
+        for start in range(0, len(figures), columns_per_row):
+            row_figures = figures[start : start + columns_per_row]
+            cols = st.columns(len(row_figures))
+            for column, figure_index in zip(cols, range(start, start + len(row_figures))):
+                with column:
+                    if figure_index == 0:
+                        _measure_plot_panel(layout)
+                    st.plotly_chart(
+                        figures[figure_index],
+                        key=f"{tab_id}_figure_{figure_index}",
+                        width="stretch",
+                        config={"displayModeBar": "hover", "responsive": True, "scrollZoom": True},
+                    )
+
+    if case_option_rows:
+        st.subheader("Case option descriptions")
+        case_options = pd.DataFrame(case_option_rows)
+        styles = pd.DataFrame("", index=case_options.index, columns=case_options.columns)
+        styles["Option"] = "font-weight: bold"
+        styles.loc[case_options["Case filter"].ne(""), "Case filter"] = "font-weight: bold"
+        st.dataframe(
+            case_options.style.apply(lambda _: styles, axis=None),
+            hide_index=True,
+            width="stretch",
+            height=min(40 + 34 * len(case_options), 560),
+        )
+
+    if violation_heading is not None:
+        _render_violation_table(
+            violation_table_key or f"{tab_id}_limit_violations",
+            violation_heading,
+            violation_rows or (),
+            violation_empty_message,
+        )
+
+    st.download_button(
+        "Download plotted data (CSV)",
+        data=lambda: plotted_data_csv(plot_set.bundles),
+        file_name=f"{tab_id}_plotted_data.csv",
+        mime="text/csv",
+        key=f"{tab_id}_download",
+        on_click="ignore",
+    )
+def _case_option_description_rows(
+    cases: Sequence[CaseData],
+    headers: dict[int, str],
+    descriptions: dict[str, str],
+) -> tuple[dict[str, str], ...]:
+    if not descriptions:
+        return ()
+    token_count = max((len(case.tokens) for case in cases), default=0)
+    rows: list[dict[str, str]] = []
+    for position in range(token_count):
+        heading = token_heading(position + 1, headers)
+        for option_index, option in enumerate(token_values(cases, position)):
+            rows.append(
+                {
+                    "Case filter": heading if option_index == 0 else "",
+                    "Option": option,
+                    "Description": descriptions.get(option, "—"),
+                }
+            )
+    return tuple(rows)
+
+
+def _render_tabs(
+    cases: Sequence[CaseData],
+    catalogue: ObjectCatalogue,
+    label_cases: Sequence[CaseData],
+    mapping: MappingResult | None = None,
+) -> tuple[ValidationIssue, ...]:
+    issues: list[ValidationIssue] = []
+    mapping = mapping or MappingResult({}, ())
+    case_option_rows = _case_option_description_rows(label_cases, mapping.headers, mapping.descriptions)
+    tabs = st.tabs(TAB_NAMES, on_change="rerun", key="plot_tabs")
+    active_index = next((index for index, tab in enumerate(tabs) if tab.open), 0)
+
+    with tabs[active_index]:
+        if active_index == 0:
+            tab_id, source_options, source_key, label = "wtg_pq", catalogue.wtg_pq, "pq_objects", "WTG objects"
+            defaults = source_options[:1]
+        elif active_index == 1:
+            tab_id, source_options, source_key, label = "wtg_voltage", catalogue.wtg_voltage, "voltage_objects", "WTG objects"
+            defaults = source_options[:1]
+        elif active_index == 2:
+            tab_id, source_options, source_key, label = "equipment_loading", catalogue.loading, "loading_objects", "Equipment channels"
+            defaults = source_options[:1]
+        elif active_index == 3:
+            tab_id, source_options, source_key, label = "poc_pq", catalogue.poc, "poc_objects", "POC objects"
+            defaults = source_options[:1]
+        else:
+            tab_id, source_options, source_key, label = "power_factor", catalogue.power_factor, "pf_objects", "Power-factor channels"
+            defaults = source_options[:1]
+
+        layout_tab_id = tab_id
+        group_views = (
+            _grouped_source_options(source_options, mapping.grouping)
+            if active_index in (2, 4) and mapping.grouping
+            else ()
+        )
+        if group_views:
+            group_labels = [group for group, _ in group_views]
+            group_tabs_key = f"{tab_id}_groups"
+            if st.session_state.get(group_tabs_key) not in group_labels:
+                st.session_state.pop(group_tabs_key, None)
+            group_tabs = st.tabs(group_labels, on_change="rerun", key=group_tabs_key)
+            group_index = next((index for index, tab in enumerate(group_tabs) if tab.open), 0)
+            group_name, source_options = group_views[group_index]
+            group_slug = re.sub(r"[^\w-]+", "_", group_name.casefold()).strip("_")
+            group_token = f"{group_slug}_{sha256(group_name.encode('utf-8')).hexdigest()[:6]}"
+            source_key = f"{source_key}_group_{group_token}"
+            tab_id = f"{tab_id}_group_{group_token}"
+            defaults = source_options[:1]
+
+        selected = _initial_selection(source_key, label, source_options, defaults)
+
+        controls_col, layout_col = st.columns([3, 1], vertical_alignment="center")
+        with controls_col:
+            if active_index == 0:
+                with st.container(
+                    horizontal=True,
+                    horizontal_alignment="left",
+                    vertical_alignment="center",
+                    gap="small",
+                    width="content",
+                ):
+                    show_qmin = st.checkbox(
+                        "Show Qmin", value=True, key="pq_show_qmin", width="content"
+                    )
+                    show_qmax = st.checkbox(
+                        "Show Qmax", value=True, key="pq_show_qmax", width="content"
+                    )
+            elif active_index == 1:
+                min_col, max_col = st.columns([1, 1], vertical_alignment="bottom")
+                with min_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    _inline_control_label("Min voltage (p.u.)")
+                    low = st.number_input(
+                        "Min voltage (p.u.)",
+                        value=0.92,
+                        step=0.01,
+                        format="%.2f",
+                        key="voltage_reference_low",
+                        label_visibility="collapsed",
+                    )
+                with max_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    _inline_control_label("Max voltage (p.u.)")
+                    high = st.number_input(
+                        "Max voltage (p.u.)",
+                        value=1.08,
+                        step=0.01,
+                        format="%.2f",
+                        key="voltage_reference_high",
+                        label_visibility="collapsed",
+                    )
+            elif active_index == 2:
+                source_col, limit_col = st.columns([2, 1], vertical_alignment="bottom")
+                x_default = "POC1" if "POC1" in catalogue.poc else (catalogue.poc[0] if catalogue.poc else "")
+                if catalogue.poc:
+                    with source_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                        _inline_control_label("X-axis source")
+                        x_source = st.selectbox(
+                            "X-axis source",
+                            catalogue.poc,
+                            key="loading_x_source",
+                            index=catalogue.poc.index(x_default),
+                            label_visibility="collapsed",
+                        )
+                else:
+                    x_source = ""
+                with limit_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    _inline_control_label("Loading limit (%)")
+                    reference = st.number_input(
+                        "Loading limit (%)",
+                        min_value=0.0,
+                        value=100.0,
+                        step=1.0,
+                        key="loading_reference_value",
+                        label_visibility="collapsed",
+                    )
+            elif active_index == 4:
+                x_col, sign_col = st.columns([1.2, 1.4], vertical_alignment="bottom")
+                with x_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    _inline_control_label("X-axis")
+                    x_mode = st.selectbox(
+                        "X-axis",
+                        ("Sweep index", "Active power interchange"),
+                        key="pf_x_mode",
+                        label_visibility="collapsed",
+                    )
+                x_source = "Sweep index"
+                if x_mode != "Sweep index":
+                    x_default = "POC1" if "POC1" in catalogue.poc else (catalogue.poc[0] if catalogue.poc else "")
+                    if catalogue.poc:
+                        with x_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                            _inline_control_label("Active interchange source")
+                            x_source = st.selectbox(
+                                "Active interchange source",
+                                catalogue.poc,
+                                key="pf_x_source",
+                                index=catalogue.poc.index(x_default),
+                                label_visibility="collapsed",
+                            )
+                    else:
+                        x_source = ""
+                with sign_col.container(horizontal=True, vertical_alignment="center", gap="small"):
+                    _inline_control_label("Power-factor sign")
+                    sign_mode = st.selectbox(
+                        "Power-factor sign",
+                        ("Original PowerFactory plot", "Raw exported values", "Invert selected channels"),
+                        key="pf_sign_mode",
+                        label_visibility="collapsed",
+                    )
+        with layout_col.container(horizontal_alignment="right", vertical_alignment="center"):
+            layout = _plot_layout_control(layout_tab_id)
+
+        if active_index == 1 and low >= high:
+            st.warning("Min voltage must be lower than max voltage.")
+
+        options = PlotOptions(layout=layout, panel_width=_plot_panel_width(layout))
+
+        labels = _case_label_map(label_cases)
+        violation_heading = None
+        violation_rows = None
+        violation_empty_message = ""
+        if active_index == 0:
+            violation_heading = "WTG P–Q limit violations"
+            violation_rows = _cached_violation_rows(
+                _violation_cache_signature("wtg_pq", cases, selected, labels),
+                wtg_pq_limit_violations,
+                tuple(cases),
+                tuple(selected),
+                labels,
+                (),
+            )
+            violation_empty_message = "No selected WTG P–Q points fall outside the available Qmin/Qmax limits."
+        elif active_index == 1:
+            violation_heading = "WTG terminal-voltage limit violations"
+            parameters = (float(low), float(high))
+            violation_rows = _cached_violation_rows(
+                _violation_cache_signature("wtg_voltage", cases, selected, labels, parameters),
+                wtg_voltage_limit_violations,
+                tuple(cases),
+                tuple(selected),
+                labels,
+                parameters,
+            )
+            violation_empty_message = (
+                "Set the minimum below the maximum to check for voltage limit violations."
+                if low >= high
+                else "No selected terminal-voltage points fall outside the current min/max limits."
+            )
+        elif active_index == 2:
+            violation_heading = "Equipment loading limit violations"
+            parameters = (x_source, float(reference))
+            violation_rows = _cached_violation_rows(
+                _violation_cache_signature("equipment_loading", cases, selected, labels, parameters),
+                equipment_loading_limit_violations,
+                tuple(cases),
+                tuple(selected),
+                labels,
+                parameters,
+            )
+            violation_empty_message = (
+                f"No selected equipment-loading samples exceed the current {reference:g}% limit."
+            )
+        violation_table_key = (
+            _violation_table_key(tab_id, violation_rows, cases, selected)
+            if violation_heading is not None and violation_rows
+            else None
+        )
+        selected_bundle_ids = _selected_violation_bundle_ids(
+            violation_table_key, violation_rows or ()
+        )
+
+        if not cases:
+            result = PlotSet((), (), (), ())
+        else:
+            build_kwargs: dict[str, object] = {"options": options}
+            build_args: tuple = (cases, selected, labels)
+            if active_index == 0:
+                builder = build_wtg_pq_figures
+                build_kwargs.update(
+                    show_qmin=show_qmin,
+                    show_qmax=show_qmax,
+                    selected_bundle_ids=selected_bundle_ids,
+                )
+            elif active_index == 1:
+                builder = build_wtg_voltage_figures
+                build_kwargs.update(
+                    show_references=low < high,
+                    low_reference=float(low),
+                    high_reference=float(high),
+                    selected_bundle_ids=selected_bundle_ids,
+                )
+            elif active_index == 2:
+                builder = build_equipment_loading_figures
+                build_args = (cases, selected, x_source, labels)
+                build_kwargs.update(
+                    loading_reference=float(reference),
+                    selected_bundle_ids=selected_bundle_ids,
+                )
+            elif active_index == 3:
+                builder = build_poc_pq_figures
+            else:
+                builder = build_power_factor_figures
+                build_kwargs.update(x_source=x_source, pf_sign_mode=sign_mode)
+
+            if active_index == 2 and not x_source:
+                result = PlotSet((), (), (), ())
+            elif active_index == 4 and x_mode != "Sweep index" and not x_source:
+                result = PlotSet((), (), (), ())
+            else:
+                settings = dict(build_kwargs)
+                if active_index == 2:
+                    settings["x_source"] = x_source
+                result = _cached_plot_set(
+                    _plot_cache_signature(tab_id, cases, selected, labels, options, settings),
+                    builder,
+                    build_args,
+                    build_kwargs,
+                )
+        issues.extend(result.issues)
+        _render_plotset(
+            tab_id,
+            result,
+            cases,
+            layout,
+            violation_heading=violation_heading,
+            violation_rows=violation_rows,
+            violation_empty_message=violation_empty_message,
+            violation_table_key=violation_table_key,
+            case_option_rows=case_option_rows,
+        )
+
+    return tuple(issues)
+
+
+def _header_variation_issues(cases: Sequence[CaseData]) -> tuple[ValidationIssue, ...]:
+    if len(cases) < 2:
+        return ()
+    channel_sets = {
+        case.case_id: {(channel.object_name, channel.metric_description) for channel in case.channels}
+        for case in cases
+    }
+    union = set().union(*channel_sets.values())
+    result = []
+    for case in cases:
+        missing = union - channel_sets[case.case_id]
+        if missing:
+            result.append(
+                ValidationIssue(
+                    "warning",
+                    "header_channel_variation",
+                    f"{case.filename}: {len(missing)} channel(s) found in other cases are absent here; plotting uses semantic object and metric matches.",
+                    case.source_path,
+                    case.case_id,
+                )
+            )
+    return tuple(result)
+
+
+def _group_validation_issues(
+    issues: Sequence[ValidationIssue],
+) -> tuple[tuple[ValidationIssue, int], ...]:
+    groups: dict[tuple[str, str, str, str], list[ValidationIssue]] = {}
+    for issue in issues:
+        key = (issue.severity, issue.code, issue.message, issue.object_name)
+        groups.setdefault(key, []).append(issue)
+    return tuple(
+        (
+            group[0],
+            len({issue.source_path for issue in group if issue.source_path}) or len(group),
+        )
+        for group in groups.values()
+    )
+
+
+def _source_label(source_path: str) -> str:
+    normalized = source_path.replace("\\", "/")
+    if "!/" in normalized:
+        archive, member = normalized.split("!/", 1)
+        return f"{PurePosixPath(archive).name} → {member}"
+    return PurePosixPath(normalized).name or "—"
+
+
+def main() -> None:
+    st.set_page_config(page_title="MPE Load Flow Dashboard", page_icon=str(APP_ICON_PATH), layout="wide")
+
+    with st.sidebar:
+        st.image(str(APP_LOGO_PATH), width=210)
+        uploaded_values = st.file_uploader(
+            "Upload CSV, ZIP or Mapping workbook",
+            type=("csv", "zip", "xlsx"),
+            accept_multiple_files=True,
+            key="source_uploads",
+            help="Uploads stay in this browser session and are not written to disk.",
+        )
+
+    stat_signature = _local_stat_signature(INPUT_DIR)
+    local_files = _cached_local_inputs(INPUT_DIR, stat_signature)
+    uploaded_values = uploaded_values or []
+    upload_signature = tuple(
+        (uploaded.file_id, uploaded.name, uploaded.size)
+        for uploaded in uploaded_values
+    )
+    uploaded_files = _cached_upload_inputs(upload_signature, tuple(uploaded_values))
+    source_files = tuple(local_files) + uploaded_files
+    mapping_sources = tuple(
+        source
+        for source in source_files
+        if Path(source.name).suffix.casefold() == ".xlsx" and is_mapping_filename(source.name)
+    )
+    result_sources = tuple(
+        source for source in source_files if Path(source.name).suffix.casefold() != ".xlsx"
+    )
+    source_signature = _source_signature(result_sources)
+    with st.spinner("Indexing result sources…"):
+        loaded = _cached_parse(source_signature, result_sources)
+    parsed = loaded.parsed
+    catalogue = _cached_object_catalogue(source_signature, parsed.cases)
+
+    with st.sidebar:
+        all_mapping_sources = (*loaded.mapping_files, *mapping_sources)
+        _, mapping_result, mapping_selection_issues = _select_mapping(all_mapping_sources)
+        if parsed.cases:
+            st.markdown("**Cases**")
+            st.button("All cases", key="all_cases", on_click=_select_all_cases, width="stretch")
+            selected_cases = _case_filter_controls(parsed.cases, mapping_result.headers)
+        else:
+            selected_cases = []
+
+    st.header("MPE Load Flow Dashboard")
+    if not parsed.cases:
+        st.info("Upload a CSV or ZIP in the sidebar to display plots.")
+        plot_issues = ()
+    else:
+        plot_issues = _render_tabs(selected_cases, catalogue, parsed.cases, mapping_result)
+
+    all_issues = [
+        *loaded.issues,
+        *parsed.issues,
+        *mapping_selection_issues,
+        *mapping_result.issues,
+        *loaded.header_issues,
+        *plot_issues,
+    ]
+    grouped_issues = _group_validation_issues(all_issues)
+    errors = sum(issue.severity == "error" for issue, _ in grouped_issues)
+    warnings = sum(issue.severity == "warning" for issue, _ in grouped_issues)
+    notes = sum(issue.severity == "info" for issue, _ in grouped_issues)
+    error_label = "error" if errors == 1 else "errors"
+    warning_label = "warning" if warnings == 1 else "warnings"
+    validation_title = (
+        "Data validation"
+        if not all_issues
+        else f"Data validation · {errors} {error_label} · {warnings} {warning_label}"
+    )
+    with st.expander(validation_title, expanded=errors > 0):
+        st.caption(
+            f"{len(parsed.cases):,} valid cases from {loaded.csv_count:,} CSVs · "
+            f"{len(local_files):,} local inputs · {len(uploaded_files):,} uploaded inputs"
+        )
+        if grouped_issues:
+            filenames = {case.case_id: case.filename for case in parsed.cases}
+            rows = []
+            for issue, affected_files in grouped_issues:
+                message = issue.message
+                filename = filenames.get(issue.case_id, "")
+                if filename and message.startswith(f"{filename}: "):
+                    message = message[len(filename) + 2 :]
+                row = {
+                    "Severity": issue.severity,
+                    "Issue": message,
+                    "Affected files": affected_files,
+                    "File": _source_label(issue.source_path),
+                }
+                if issue.object_name:
+                    row["Object"] = issue.object_name
+                rows.append(row)
+            st.dataframe(rows, hide_index=True, width="stretch")
+            if any(count > 1 for _, count in grouped_issues):
+                st.caption("Identical issues are grouped; File shows one example.")
+        else:
+            st.caption("No data issues.")
+        if notes:
+            st.caption(f"{notes} informational note(s)")
+        st.caption("This dashboard displays existing results; it does not run PowerFactory or assess compliance.")
+
+
+if __name__ == "__main__":
+    main()
