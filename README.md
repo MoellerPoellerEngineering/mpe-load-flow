@@ -2,6 +2,13 @@
 
 An independent Streamlit tool for exploring PowerFactory load-flow sweep results. It provides interactive plots for wind turbine, point-of-connection and equipment results, optional limit checks, and plotted-data CSV export. It does not run PowerFactory studies.
 
+## Open the app
+
+- [Load Flow Dashboard](https://mpe-load-flow.streamlit.app/)
+- [MPE Engineering Tools](https://mpe-engineering-tools.streamlit.app/) — landing page for all three dashboards.
+
+The dashboard and landing page are separate public Streamlit Community Cloud apps.
+
 ## Input files
 
 - Upload result CSV files individually or together in a ZIP archive.
@@ -18,7 +25,9 @@ Create the dedicated Conda environment and start the app from this repository di
     conda activate mpe-load-flow
     streamlit run app.py
 
-Install requirements-dev.txt in the environment to run tests with pytest.
+Run the test suite in this environment with:
+
+    python -m pytest -q
 
 ## Review and limitations
 
